@@ -205,3 +205,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# data / datasets
+dataset/
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# model checkpoints / logs
+checkpoints/
+runs/
+logs/
+roi_debug/
+
+# system / ide
+.DS_Store
+.idea/
+.vscode/
