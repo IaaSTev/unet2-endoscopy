@@ -5,18 +5,47 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
-DATA_ROOT = "/Users/katiexie/Desktop/unet2/Dataset_BUSI_with_GT/malignant"
+DATA_ROOT = "/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"
 
-def build_pairs(root=DATA_ROOT):
-    imgs = sorted(glob.glob(os.path.join(root, "*.png")))
+import os, glob, re
+
+def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
+    root = os.path.expanduser(root)
+    assert os.path.exists(root), f"root not exist: {root}"
+
+    all_png = sorted(glob.glob(os.path.join(root, "**", "*.png"), recursive=True))
+
     pairs = []
-    for p in imgs:
-        if p.endswith("_mask.png"):
+    for img in all_png:
+        base, ext = os.path.splitext(img)
+        fname = os.path.basename(base).lower()
+
+        # 跳过 mask 文件本身（避免把 mask 当 image）
+        if "_mask" in fname:
             continue
-        mask_p = p.replace(".png", "_mask.png")
-        if os.path.exists(mask_p):
-            pairs.append((p, mask_p))
+
+        # 1) 优先找 xxx_mask.png
+        mask0 = base + "_mask" + ext
+        if os.path.exists(mask0):
+            pairs.append((img, mask0))
+            continue
+
+        # 2) 找 xxx_mask_*.png（例如 _mask_1）
+        cand = glob.glob(base + "_mask_*" + ext)
+        if len(cand) > 0:
+            # 选编号最小的（_mask_1 最先）
+            def mask_index(p):
+                m = re.search(r"_mask_(\d+)\.png$", p.lower())
+                return int(m.group(1)) if m else 10**9
+            cand_sorted = sorted(cand, key=mask_index)
+            pairs.append((img, cand_sorted[0]))
+            continue
+
+        # 找不到就跳过
+        # print("[WARN] no mask for", img)
+
     return pairs
+
 
 class SegDataset(Dataset):
     def __init__(self, pairs, size=256):
