@@ -1,13 +1,18 @@
 import os
 import glob
+import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
+# Albumentations
+import albumentations as A
+import cv2
+
+
 DATA_ROOT = "/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"
 
-import os, glob, re
 
 def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
     root = os.path.expanduser(root)
@@ -17,6 +22,12 @@ def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
 
     pairs = []
     for img in all_png:
+        rel = img.lower()
+
+        # ===== 只保留 benign / malignant（显式过滤）=====
+        if ("/benign/" not in rel) and ("/malignant/" not in rel):
+            continue
+
         base, ext = os.path.splitext(img)
         fname = os.path.basename(base).lower()
 
@@ -33,7 +44,6 @@ def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
         # 2) 找 xxx_mask_*.png（例如 _mask_1）
         cand = glob.glob(base + "_mask_*" + ext)
         if len(cand) > 0:
-            # 选编号最小的（_mask_1 最先）
             def mask_index(p):
                 m = re.search(r"_mask_(\d+)\.png$", p.lower())
                 return int(m.group(1)) if m else 10**9
@@ -41,16 +51,45 @@ def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
             pairs.append((img, cand_sorted[0]))
             continue
 
-        # 找不到就跳过
-        # print("[WARN] no mask for", img)
-
     return pairs
 
 
 class SegDataset(Dataset):
-    def __init__(self, pairs, size=256):
+    def __init__(self, pairs, size=256, augment=False):
+        """
+        pairs: list of (img_path, mask_path)
+        size:  output resize size (H=W=size)
+        augment: whether to apply training augmentations
+        """
         self.pairs = pairs
         self.size = size
+        self.augment = augment
+
+        # ===== Train augmentations (stable for your albumentations version) =====
+        self.train_tf = A.Compose([
+            # ---- 强度类（推荐）----
+            A.RandomBrightnessContrast(p=0.5),
+            A.RandomGamma(p=0.3),
+            A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.15),
+
+            # ---- 轻量几何类（mask 同步，填充为 0）----
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.08,
+                scale_limit=0.10,
+                rotate_limit=10,
+                interpolation=cv2.INTER_LINEAR,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.4
+            ),
+        ])
+
+        # ===== Resize (mask must be nearest) =====
+        self.resize_img = A.Resize(self.size, self.size, interpolation=cv2.INTER_LINEAR)
+        self.resize_msk = A.Resize(self.size, self.size, interpolation=cv2.INTER_NEAREST)
 
     def __len__(self):
         return len(self.pairs)
@@ -58,12 +97,30 @@ class SegDataset(Dataset):
     def __getitem__(self, idx):
         img_path, mask_path = self.pairs[idx]
 
-        img = Image.open(img_path).convert("L").resize((self.size, self.size))
-        mask = Image.open(mask_path).convert("L").resize((self.size, self.size), resample=Image.NEAREST)
+        # 读原图（不在 PIL 里 resize，避免影响增强）
+        img = Image.open(img_path).convert("L")
+        mask = Image.open(mask_path).convert("L")
 
-        img = np.array(img, dtype=np.float32) / 255.0
-        mask = (np.array(mask, dtype=np.uint8) > 0).astype(np.float32)
+        img = np.array(img, dtype=np.uint8)   # (H,W)
+        mask = np.array(mask, dtype=np.uint8) # (H,W)
 
-        img = torch.from_numpy(img)[None, ...]   # (1,H,W)
-        mask = torch.from_numpy(mask)[None, ...] # (1,H,W)
+        # mask 二值化（0/255 -> 0/1）
+        mask = (mask > 0).astype(np.uint8)
+
+        if self.augment:
+            out = self.train_tf(image=img, mask=mask)
+            img, mask = out["image"], out["mask"]
+
+        # resize（mask nearest）
+        img = self.resize_img(image=img)["image"]
+        mask = self.resize_msk(image=mask)["image"]
+
+        # normalize / to float
+        img = img.astype(np.float32) / 255.0
+        mask = mask.astype(np.float32)  # 0/1
+
+        # to torch (1,H,W)
+        img = torch.from_numpy(img)[None, ...]
+        mask = torch.from_numpy(mask)[None, ...]
         return img, mask
+

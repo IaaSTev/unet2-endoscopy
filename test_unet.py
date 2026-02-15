@@ -1,9 +1,9 @@
 import torch
-from unet import UNet
+from unet import AttentionUNet
 from boundary import make_boundary_band_from_logits
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = UNet(in_channels=1, out_channels=1, base=32).to(device)
+model = AttentionUNet(in_channels=1, out_channels=1, base=32).to(device)
 
 x = torch.randn(2, 1, 256, 256).to(device)
 logits = model(x)
