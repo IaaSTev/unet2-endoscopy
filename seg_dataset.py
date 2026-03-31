@@ -24,8 +24,8 @@ def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
     for img in all_png:
         rel = img.lower()
 
-        # ===== 只保留 benign / malignant（显式过滤）=====
-        if ("/benign/" not in rel) and ("/malignant/" not in rel):
+        # ===== 保留 benign / malignant / normal =====
+        if ("/benign/" not in rel) and ("/malignant/" not in rel) and ("/normal/" not in rel):
             continue
 
         base, ext = os.path.splitext(img)
@@ -35,21 +35,27 @@ def build_pairs(root="/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"):
         if "_mask" in fname:
             continue
 
-        # 1) 优先找 xxx_mask.png
+        mask_paths = []
+
+        # 1) 标准 mask: xxx_mask.png
         mask0 = base + "_mask" + ext
         if os.path.exists(mask0):
-            pairs.append((img, mask0))
-            continue
+            mask_paths.append(mask0)
 
-        # 2) 找 xxx_mask_*.png（例如 _mask_1）
+        # 2) 额外 mask: xxx_mask_*.png（例如 _mask_1, _mask_2）
         cand = glob.glob(base + "_mask_*" + ext)
         if len(cand) > 0:
             def mask_index(p):
                 m = re.search(r"_mask_(\d+)\.png$", p.lower())
                 return int(m.group(1)) if m else 10**9
             cand_sorted = sorted(cand, key=mask_index)
-            pairs.append((img, cand_sorted[0]))
-            continue
+            mask_paths.extend(cand_sorted)
+
+        # 去重并保持顺序
+        mask_paths = list(dict.fromkeys(mask_paths))
+
+        if len(mask_paths) > 0:
+            pairs.append((img, mask_paths))
 
     return pairs
 
@@ -95,17 +101,28 @@ class SegDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        img_path, mask_path = self.pairs[idx]
+        img_path, mask_paths = self.pairs[idx]
 
         # 读原图（不在 PIL 里 resize，避免影响增强）
         img = Image.open(img_path).convert("L")
-        mask = Image.open(mask_path).convert("L")
-
         img = np.array(img, dtype=np.uint8)   # (H,W)
-        mask = np.array(mask, dtype=np.uint8) # (H,W)
 
-        # mask 二值化（0/255 -> 0/1）
-        mask = (mask > 0).astype(np.uint8)
+        # 支持单个 mask 路径或多个 mask 路径；多个时做并集
+        if isinstance(mask_paths, str):
+            mask_paths = [mask_paths]
+
+        mask = None
+        for mp in mask_paths:
+            m = Image.open(mp).convert("L")
+            m = np.array(m, dtype=np.uint8)
+            m = (m > 0).astype(np.uint8)
+            if mask is None:
+                mask = m
+            else:
+                mask = np.maximum(mask, m)
+
+        if mask is None:
+            raise ValueError(f"No valid masks found for image: {img_path}")
 
         if self.augment:
             out = self.train_tf(image=img, mask=mask)
@@ -123,4 +140,3 @@ class SegDataset(Dataset):
         img = torch.from_numpy(img)[None, ...]
         mask = torch.from_numpy(mask)[None, ...]
         return img, mask
-

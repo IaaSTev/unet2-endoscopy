@@ -1,3 +1,7 @@
+import os, sys
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 import os, random
 import numpy as np
 import torch
@@ -5,8 +9,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
+import argparse
+
 from boundary import make_boundary_band_from_prob
-from seg_dataset import build_pairs, SegDataset
+from data_preparation.seg_dataset import build_pairs, SegDataset
+
 
 
 # =========================
@@ -22,6 +29,7 @@ def set_seed(seed=42):
 # =========================
 # Metrics (Dice)
 # =========================
+
 @torch.no_grad()
 def dice_from_logits(logits, y, eps=1e-6):
     prob = torch.sigmoid(logits)
@@ -29,6 +37,19 @@ def dice_from_logits(logits, y, eps=1e-6):
     inter = (pred * y).sum(dim=(1,2,3))
     union = pred.sum(dim=(1,2,3)) + y.sum(dim=(1,2,3))
     return ((2*inter + eps) / (union + eps)).mean().item()
+
+
+# Pixel accuracy for binary segmentation
+@torch.no_grad()
+def accuracy_from_logits(logits, y):
+    """
+    Pixel accuracy for binary segmentation.
+    logits: (B,1,H,W)
+    y:      (B,1,H,W) in {0,1}
+    """
+    prob = torch.sigmoid(logits)
+    pred = (prob > 0.5).float()
+    return (pred == y).float().mean().item()
 
 
 # =========================
@@ -332,7 +353,8 @@ class AttentionUNet(nn.Module):
 # =========================
 def train_one_epoch(model, loader, opt, loss_fn, device):
     model.train()
-    total = 0.0
+    total_loss = 0.0
+    total_acc = 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         opt.zero_grad()
@@ -340,14 +362,16 @@ def train_one_epoch(model, loader, opt, loss_fn, device):
         loss = loss_fn(logits, y)
         loss.backward()
         opt.step()
-        total += loss.item()
-    return total / max(len(loader), 1)
+        total_loss += loss.item()
+        total_acc += accuracy_from_logits(logits, y)
+    n = max(len(loader), 1)
+    return total_loss / n, total_acc / n
 
 
 @torch.no_grad()
 def validate(model, loader, loss_fn, device):
     model.eval()
-    total_loss, total_dice = 0.0, 0.0
+    total_loss, total_acc, total_dice = 0.0, 0.0, 0.0
 
     # ROI quality accumulators
     cov_sum, pur_sum, cov_n, pur_n = 0.0, 0.0, 0, 0
@@ -367,6 +391,7 @@ def validate(model, loader, loss_fn, device):
         logits = model(x)
 
         total_loss += loss_fn(logits, y).item()
+        total_acc += accuracy_from_logits(logits, y)
         total_dice += dice_from_logits(logits, y)
 
         # ROI quality part
@@ -404,6 +429,7 @@ def validate(model, loader, loss_fn, device):
 
     n = max(len(loader), 1)
     val_loss = total_loss / n
+    val_acc = total_acc / n
     val_dice = total_dice / n
 
     coverage = cov_sum / max(cov_n, 1)
@@ -420,14 +446,26 @@ def validate(model, loader, loss_fn, device):
         "gt_bd_ratio": gt_bd_ratio_sum / max(ratio_n, 1),
     }
 
-    return val_loss, val_dice, roi_metrics
+    return val_loss, val_acc, val_dice, roi_metrics
 
 
 # =========================
 # Main
 # =========================
 def main():
-    set_seed(42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, required=True,
+                        help="Dataset root, e.g. /Users/.../Dataset_BUSI_with_GT")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--size", type=int, default=256)
+    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
 
     if torch.cuda.is_available():
         device = "cuda"
@@ -437,43 +475,47 @@ def main():
         device = "cpu"
     print("device:", device)
 
-    DATA_ROOT = "/content/drive/MyDrive/datasets/Dataset_BUSI_with_GT"
+    DATA_ROOT = os.path.expanduser(args.data_dir)
     pairs = build_pairs(DATA_ROOT)
 
     print("num_pairs:", len(pairs))
     assert len(pairs) > 0, "没找到任何 image+mask 配对。检查文件名是否是 xxx.png 和 xxx_mask.png"
 
-    idx = np.random.RandomState(42).permutation(len(pairs))
+    idx = np.random.RandomState(args.seed).permutation(len(pairs))
     split = int(0.8 * len(pairs))
     train_pairs = [pairs[i] for i in idx[:split]]
     val_pairs   = [pairs[i] for i in idx[split:]]
 
-    train_ds = SegDataset(train_pairs, size=256, augment=True)
-    val_ds   = SegDataset(val_pairs, size=256, augment=False)
+    train_ds = SegDataset(train_pairs, size=args.size, augment=True)
+    val_ds   = SegDataset(val_pairs, size=args.size, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True,  num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=8, shuffle=False, num_workers=2, pin_memory=True)
+    pin = (device == "cuda")
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  num_workers=args.workers, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False, num_workers=args.workers, pin_memory=pin)
 
     # ✅ model: Attention U-Net
     model = AttentionUNet(in_channels=1, out_channels=1, base=32).to(device)
 
     # ✅ loss: boundary-prioritized combo loss
-    # 起步推荐：w_band=0.7, band_k=11
     loss_fn = ComboLoss(w_bce=1.0, w_dice=1.0, w_band=0.3, band_k=11)
 
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs(args.save_dir, exist_ok=True)
     best_dice = -1.0
     last_epoch = 0
 
-    for epoch in range(1, 31):
+    for epoch in range(1, args.epochs + 1):
         last_epoch = epoch
 
-        tr_loss = train_one_epoch(model, train_loader, opt, loss_fn, device)
-        va_loss, va_dice, roi = validate(model, val_loader, loss_fn, device)
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, loss_fn, device)
+        va_loss, va_acc, va_dice, roi = validate(model, val_loader, loss_fn, device)
 
-        print(f"Epoch {epoch:02d} | train_loss={tr_loss:.4f} | val_loss={va_loss:.4f} | val_dice={va_dice:.4f}")
+        print(
+            f"Epoch {epoch:02d} | "
+            f"train_loss={tr_loss:.4f} | train_acc={tr_acc:.4f} | "
+            f"val_loss={va_loss:.4f} | val_acc={va_acc:.4f} | val_dice={va_dice:.4f}"
+        )
         print("ROI metrics:",
               f"coverage={roi['coverage']:.3f},",
               f"purity={roi['purity']:.3f},",
@@ -486,12 +528,12 @@ def main():
             best_dice = va_dice
             torch.save(
                 {"epoch": epoch, "model": model.state_dict(), "best_dice": best_dice},
-                "checkpoints/best.pt"
+                os.path.join(args.save_dir, "best.pt")
             )
 
     torch.save(
         {"epoch": last_epoch, "model": model.state_dict(), "best_dice": best_dice},
-        "checkpoints/last.pt"
+        os.path.join(args.save_dir, "last.pt")
     )
     print("Done. best_dice =", best_dice)
 
